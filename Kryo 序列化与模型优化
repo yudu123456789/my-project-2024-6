@@ -1,0 +1,22 @@
+package com.alibaba.interview.config;
+
+import com.alibaba.interview.core.QuadTree;
+import com.alibaba.interview.model.*;
+import com.esotericsoftware.kryo.Kryo;
+import org.apache.spark.serializer.KryoRegistrator;
+
+/**
+ * 极致性能优化：自定义 Kryo 注册器
+ * 目的：减少对象序列化后的体积（通常减少 5-10 倍），降低 GC 压力和 Network IO
+ */
+public class AppKryoRegistrator implements KryoRegistrator {
+    @Override
+    public void registerClasses(Kryo kryo) {
+        // 注册业务实体类
+        kryo.register(TrajectoryPoint.class);
+        kryo.register(SpatialFence.class);
+        // 注册核心数据结构，保证 Broadcast 传输效率
+        kryo.register(QuadTree.class);
+        kryo.register(java.util.ArrayList.class);
+    }
+}
