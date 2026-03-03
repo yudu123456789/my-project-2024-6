@@ -1,0 +1,108 @@
+package com.alibaba.interview;
+
+import com.alibaba.interview.config.AppKryoRegistrator;
+import com.alibaba.interview.core.QuadTree;
+import com.alibaba.interview.core.Rectangle;
+import com.alibaba.interview.model.SpatialFence;
+import com.alibaba.interview.model.TrajectoryPoint;
+import com.alibaba.interview.util.GeoUtils;
+import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.util.LongAccumulator;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 分布式轨迹匹配引擎 (Production Ready)
+ * 
+ * 架构亮点：
+ * 1. Driver 端构建 QuadTree 索引并 Broadcast，消除 Executor 端重复计算。
+ * 2. 使用 mapPartitions 替代 map，大幅降低对象创建开销。
+ * 3. 引入 LongAccumulator 做分布式监控。
+ */
+public class TrajectoryMatchingEngine {
+
+    public static void main(String[] args) {
+        // 1. JVM & Spark 底层调优 (面试核心)
+        SparkConf conf = new SparkConf()
+            .setAppName("Alibaba_Trajectory_Matcher")
+            .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+            .set("spark.kryo.registrator", AppKryoRegistrator.class.getName())
+            // G1GC 调优：应对大堆内存，控制停顿
+            .set("spark.executor.extraJavaOptions", "-XX:+UseG1GC -XX:InitiatingHeapOccupancyPercent=35 -XX:MaxGCPauseMillis=200")
+            // 堆外内存优化：如果用到 Netty 传输大量数据，开启 Off-Heap
+            .set("spark.memory.offHeap.enabled", "true")
+            .set("spark.memory.offHeap.size", "2g");
+
+        SparkSession spark = SparkSession.builder().config(conf).enableHiveSupport().getOrCreate();
+        JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
+
+        // 2. 加载围栏数据 (Small Table)
+        List<SpatialFence> fences = loadFencesFromDB(); // 模拟从数据库/HDFS加载
+
+        // 3. 构建空间索引 (Build Index on Driver)
+        // 这一步是关键：不是广播 List，而是广播构建好的 QuadTree
+        // 只有构建好的树才能提供 O(logN) 的查询能力
+        Rectangle globalBounds = new Rectangle(0, 0, 180, 90);
+        QuadTree spatialIndex = new QuadTree(0, globalBounds);
+        for (SpatialFence fence : fences) {
+            spatialIndex.insert(fence);
+        }
+
+        // 4. 广播索引对象
+        Broadcast<QuadTree> broadcastIndex = jsc.broadcast(spatialIndex);
+
+        // 5. 分布式监控指标
+        LongAccumulator matchCounter = jsc.sc().longAccumulator("Matched_Points");
+        LongAccumulator emptyCounter = jsc.sc().longAccumulator("Unmatched_Points");
+
+        // 6. 加载海量轨迹数据 (Big Table)
+        JavaRDD<TrajectoryPoint> rawTrajectoryRDD = loadTrajectoryData(jsc);
+
+        // 7. 核心处理逻辑：mapPartitions
+        // 为什么用 mapPartitions？
+        // 答：避免每处理一条数据都去获取一次 Broadcast 句柄。
+        // 在 Partition 级别获取一次索引引用，处理该分区内所有数据，CPU Cache 亲和性更好。
+        JavaRDD<String> resultRDD = rawTrajectoryRDD.mapPartitions(iter -> {
+            // 获取广播的索引 (每个分区只执行一次)
+            QuadTree index = broadcastIndex.value();
+            List<String> results = new ArrayList<>();
+            List<SpatialFence> candidates = new ArrayList<>(); // 复用对象，减少 GC
+
+            while (iter.hasNext()) {
+                TrajectoryPoint point = iter.next();
+                candidates.clear();
+                
+                // A. 树查询：O(logN) 获取候选围栏 (粗筛)
+                index.retrieve(candidates, point.getLat(), point.getLon());
+                
+                boolean matched = false;
+                for (SpatialFence fence : candidates) {
+                    // B. 精确几何计算：射线法 (Ray-Casting)
+                    if (GeoUtils.contains(fence.getPolygon(), point.getLat(), point.getLon())) {
+                        results.add(point.getUid() + "\t" + fence.getId() + "\t" + point.getTimestamp());
+                        matchCounter.add(1);
+                        matched = true;
+                        break; // 假设只匹配第一个命中的围栏
+                    }
+                }
+                if (!matched) emptyCounter.add(1);
+            }
+            return results.iterator();
+        });
+
+        // 8. 触发 Action 并落盘
+        resultRDD.saveAsTextFile("hdfs://.../output");
+
+        System.out.println("Job Finished. Matched: " + matchCounter.value());
+        spark.stop();
+    }
+
+    // Mock Methods
+    private static List<SpatialFence> loadFencesFromDB() { return new ArrayList<>(); }
+    private static JavaRDD<TrajectoryPoint> loadTrajectoryData(JavaSparkContext jsc) { return jsc.emptyRDD(); }
+}
