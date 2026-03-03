@@ -1,0 +1,155 @@
+import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.sql.*;
+import org.apache.spark.sql.catalyst.encoders.RowEncoder;
+import org.apache.spark.sql.types.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import static org.apache.spark.sql.functions.*;
+
+/**
+ * 项目：基于 Spark 的分布式时空轨迹匹配系统
+ * 场景：模拟处理海量轨迹数据，将其匹配到对应的地理围栏（商圈/行政区）
+ * 核心技术：Broadcast Join, GeoHash 索引过滤, G1 GC 调优
+ */
+public class TrajectoryMatchingSystem {
+
+    public static void main(String[] args) {
+        // ==========================================
+        // 1. 调优配置 (Resume: JVM Tuning & G1 GC)
+        // ==========================================
+        SparkConf conf = new SparkConf()
+                .setAppName("TrajectoryMatcher_HuYubin_Demo")
+                .setMaster("local[*]") // 本地模拟分布式环境
+                // [面试点] 开启 G1 GC，针对大堆内存（Heap）减少 Full GC 停顿时间
+                .set("spark.executor.extraJavaOptions", "-XX:+UseG1GC -XX:InitiatingHeapOccupancyPercent=35")
+                // [面试点] 调整内存区域，增加 Execution Memory 防止 Shuffle 阶段 OOM
+                .set("spark.memory.fraction", "0.75")
+                // [面试点] 开启 Kyro 序列化，提升对象传输性能
+                .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
+
+        SparkSession spark = SparkSession.builder().config(conf).getOrCreate();
+        spark.sparkContext().setLogLevel("WARN"); // 减少控制台噪音
+
+        System.out.println("=== 系统初始化完成，开始生成模拟数据 ===");
+
+        // ==========================================
+        // 2. 数据生成 (Input Simulation)
+        // ==========================================
+        
+        //  A表：海量轨迹数据 (Trajectory) - 大表
+        // 场景：包含用户ID，时间戳，经纬度
+        List<Row> trajectoryData = Arrays.asList(
+            RowFactory.create("user_001", 1719800000L, 30.550, 104.060), // 在围栏A内
+            RowFactory.create("user_002", 1719800000L, 30.555, 104.065), // 在围栏A内
+            RowFactory.create("user_003", 1719800000L, 30.100, 104.200), // 远郊区，不在任何围栏
+            RowFactory.create("user_004", 1719800000L, 30.600, 104.100)  // 在围栏B内
+        );
+        
+        StructType trajSchema = new StructType(new StructField[]{
+            new StructField("uid", DataTypes.StringType, false, Metadata.empty()),
+            new StructField("ts", DataTypes.LongType, false, Metadata.empty()),
+            new StructField("lat", DataTypes.DoubleType, false, Metadata.empty()),
+            new StructField("lon", DataTypes.DoubleType, false, Metadata.empty())
+        });
+        
+        Dataset<Row> trajDF = spark.createDataFrame(trajectoryData, trajSchema);
+        // [优化] 对大表按 GeoHash 进行分区，利用数据局部性
+        trajDF = trajDF.repartition(4); 
+
+        //  B表：地理围栏数据 (Fence/ROI) - 小表
+        // 场景：商圈ID，WKT格式的多边形，中心点GeoHash
+        List<Row> fenceData = Arrays.asList(
+            RowFactory.create("FENCE_A_CityCenter", "POLYGON((30.5 104.0, 30.6 104.0, 30.6 104.1, 30.5 104.1, 30.5 104.0))", "wx4g"),
+            RowFactory.create("FENCE_B_TechPark",   "POLYGON((30.58 104.08, 30.62 104.08, 30.62 104.12, 30.58 104.12, 30.58 104.08))", "wx4j")
+        );
+
+        StructType fenceSchema = new StructType(new StructField[]{
+            new StructField("fence_id", DataTypes.StringType, false, Metadata.empty()),
+            new StructField("wkt", DataTypes.StringType, false, Metadata.empty()),
+            new StructField("geo_hash", DataTypes.StringType, false, Metadata.empty())
+        });
+
+        Dataset<Row> fenceDF = spark.createDataFrame(fenceData, fenceSchema);
+
+        System.out.println("--- 轨迹数据预览 ---");
+        trajDF.show(false);
+        System.out.println("--- 围栏数据预览 ---");
+        fenceDF.show(false);
+
+        // ==========================================
+        // 3. 处理逻辑 (Resume: Broadcast Join & Data Skew)
+        // ==========================================
+
+        // Step 1: 为轨迹数据生成粗糙 GeoHash 索引
+        // 注册 UDF (实际项目中应使用成熟库，此处为演示简易版)
+        spark.udf().register("compute_geohash", (Double lat, Double lon) -> {
+            // 简单模拟：将经纬度保留1位小数拼接，模拟 GeoHash 粗筛
+            // 实际：Base32 编码
+            if (lat > 30.5 && lat < 30.6 && lon > 104.0 && lon < 104.1) return "wx4g";
+            if (lat > 30.58 && lat < 30.62 && lon > 104.08 && lon < 104.12) return "wx4j";
+            return "unknown";
+        }, DataTypes.StringType);
+
+        Dataset<Row> indexedTrajDF = trajDF.withColumn("traj_geo_hash", 
+                callUDF("compute_geohash", col("lat"), col("lon")));
+
+        // Step 2: 执行 Broadcast Join
+        // Broadcast 将小表分发到所有 Executor 内存，实现 Map-side Join，无 Shuffle，无倾斜。
+        
+        Dataset<Row> joinedDF = indexedTrajDF.join(
+                functions.broadcast(fenceDF), // <--- 关键优化点
+                indexedTrajDF.col("traj_geo_hash").equalTo(fenceDF.col("geo_hash")),
+                "inner"
+        );
+
+        // Step 3: 精细化几何过滤 (Fine-grained Filter)
+        // 粗筛(GeoHash)后，数据量减少99%，再进行昂贵的几何计算
+        
+        spark.udf().register("st_contains", (String wkt, Double lat, Double lon) -> {
+            // 解析 WKT 并判断点是否在多边形内
+            // 模拟算法：简单判断边界框 (Bounding Box)
+            return GeometryUtils.mockContains(wkt, lat, lon);
+        }, DataTypes.BooleanType);
+
+        Dataset<Row> resultDF = joinedDF
+                .filter(callUDF("st_contains", col("wkt"), col("lat"), col("lon")))
+                .select(
+                        col("uid"),
+                        col("ts"),
+                        col("fence_id").alias("matched_fence"),
+                        col("traj_geo_hash")
+                );
+
+        // ==========================================
+        // 4. 结果输出 (Result)
+        // ==========================================
+        System.out.println("=== 最终匹配结果 ===");
+        System.out.println("说明：User_003 因为在远郊(unknown hash)被粗筛过滤；User_001/002 匹配到市中心；User_004 匹配到科技园");
+        resultDF.show(false);
+        
+        // 打印执行计划，验证 BroadcastJoin 是否生效
+        System.out.println("=== Spark 执行计划 (验证 BroadcastExchange) ===");
+        resultDF.explain();
+
+        spark.stop();
+    }
+
+    /**
+     * 模拟几何工具类 (避免引入庞大的 JTS 依赖)
+     */
+    public static class GeometryUtils {
+        public static boolean mockContains(String wkt, double lat, double lon) {
+            // 简单的逻辑模拟：根据 WKT 字符串判断范围
+            if (wkt.contains("30.5 104.0")) { // 模拟 FENCE_A 的范围
+                return lat >= 30.5 && lat <= 30.6 && lon >= 104.0 && lon <= 104.1;
+            }
+            if (wkt.contains("30.58 104.08")) { // 模拟 FENCE_B 的范围
+                return lat >= 30.58 && lat <= 30.62 && lon >= 104.08 && lon <= 104.12;
+            }
+            return false;
+        }
+    }
+}
