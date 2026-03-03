@@ -1,0 +1,78 @@
+package com.alibaba.interview.core;
+
+import com.alibaba.interview.model.SpatialFence;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 自研空间索引 - 四叉树 (QuadTree)
+ * 作用：将 O(N) 的线性扫描优化为 O(log N) 的树查询
+ * 场景：Broadcast 广播到 Executor 端的只读索引结构
+ */
+public class QuadTree implements Serializable {
+    private static final int MAX_OBJECTS = 10; // 每个叶子节点最大存储数量
+    private static final int MAX_LEVELS = 5;   // 最大深度
+
+    private int level;
+    private List<SpatialFence> objects;
+    private Rectangle bounds; // 当前节点覆盖的经纬度范围
+    private QuadTree[] nodes; // 四个子节点
+
+    public QuadTree(int level, Rectangle bounds) {
+        this.level = level;
+        this.objects = new ArrayList<>();
+        this.bounds = bounds;
+        this.nodes = new QuadTree[4];
+    }
+
+    // 插入围栏数据构建索引
+    public void insert(SpatialFence fence) {
+        if (nodes[0] != null) {
+            int index = getIndex(fence.getBounds());
+            if (index != -1) {
+                nodes[index].insert(fence);
+                return;
+            }
+        }
+        objects.add(fence);
+
+        if (objects.size() > MAX_OBJECTS && level < MAX_LEVELS) {
+            if (nodes[0] == null) split();
+            int i = 0;
+            while (i < objects.size()) {
+                int index = getIndex(objects.get(i).getBounds());
+                if (index != -1) {
+                    nodes[index].insert(objects.remove(i));
+                } else {
+                    i++;
+                }
+            }
+        }
+    }
+
+    // 核心查询：找到候选围栏 (Candidate Generation)
+    // 相比全量遍历，这里只检索重叠的象限
+    public List<SpatialFence> retrieve(List<SpatialFence> returnObjects, double lat, double lon) {
+        int index = getIndex(lat, lon);
+        if (index != -1 && nodes[0] != null) {
+            nodes[index].retrieve(returnObjects, lat, lon);
+        }
+        returnObjects.addAll(objects);
+        return returnObjects;
+    }
+
+    // 辅助方法：划分四个象限
+    private void split() {
+        double subWidth = bounds.getWidth() / 2;
+        double subHeight = bounds.getHeight() / 2;
+        double x = bounds.getX();
+        double y = bounds.getY();
+        nodes[0] = new QuadTree(level + 1, new Rectangle(x + subWidth, y, subWidth, subHeight)); // NE
+        nodes[1] = new QuadTree(level + 1, new Rectangle(x, y, subWidth, subHeight)); // NW
+        nodes[2] = new QuadTree(level + 1, new Rectangle(x, y + subHeight, subWidth, subHeight)); // SW
+        nodes[3] = new QuadTree(level + 1, new Rectangle(x + subWidth, y + subHeight, subWidth, subHeight)); // SE
+    }
+
+    // ... getIndex 实现省略 (根据经纬度判断象限) ...
+}
